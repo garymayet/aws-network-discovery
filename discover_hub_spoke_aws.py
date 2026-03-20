@@ -91,7 +91,7 @@ except ImportError:
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.2.0"
 DEFAULT_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "eu-central-1", "sa-east-1",
@@ -202,6 +202,7 @@ class DiscoveryStore:
         self.nfw_endpoints: list[dict] = []
         self.r53_resolver_endpoints: list[dict] = []
         self.nat_gateways: list[dict] = []
+        self.flow_logs: list[dict] = []
         self.best_practices: list[dict] = []
 
     def summary(self) -> dict:
@@ -219,6 +220,7 @@ class DiscoveryStore:
             "Network Firewalls": len(self.network_firewalls),
             "R53 Resolver Endpoints": len(self.r53_resolver_endpoints),
             "NAT Gateways": len(self.nat_gateways),
+            "VPC Flow Logs": len(self.flow_logs),
         }
 
 
@@ -735,6 +737,24 @@ def collect_resources(
                 "PublicIPs": ", ".join(pub_ips),
             })
 
+        # ── 1.14 VPC Flow Logs ───────────────────────────────────────────
+        write_status(f"    Descubriendo VPC Flow Logs...")
+        flow_logs_raw = safe_api_call(
+            lambda: paginate(ec2, "describe_flow_logs", "FlowLogs"), default=[]
+        )
+        for fl in flow_logs_raw:
+            store.flow_logs.append({
+                "AccountId": account_id,
+                "Region": region,
+                "FlowLogId": fl.get("FlowLogId", ""),
+                "ResourceId": fl.get("ResourceId", ""),
+                "ResourceType": fl.get("ResourceType", ""),  # VPC, Subnet, NetworkInterface
+                "TrafficType": fl.get("TrafficType", ""),
+                "LogStatus": fl.get("FlowLogStatus", ""),
+                "LogDestinationType": fl.get("LogDestinationType", ""),
+                "LogDestination": fl.get("LogDestination", ""),
+            })
+
     write_status(
         f"  Recolección finalizada para cuenta {account_id}", "OK"
     )
@@ -1201,6 +1221,247 @@ def evaluate_best_practices(store: DiscoveryStore) -> None:
                 ),
             })
             write_status(f"  ⚠ DX {location}: Solo 1 conexión", "WARN")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CHECKS DE LÍNEA BASE — Aplican a TODAS las VPCs (incluso standalone)
+    # ══════════════════════════════════════════════════════════════════════
+
+    write_status("\n═══════════════════════════════════════════════════════════")
+    write_status("  Checks de línea base (todas las VPCs)")
+    write_status("═══════════════════════════════════════════════════════════")
+
+    # ── CHECK B1: VPC Flow Logs habilitados ──────────────────────────────
+    write_status("\n[CHECK B1] Validando VPC Flow Logs...")
+    vpc_ids_with_flow_logs = set()
+    for fl in store.flow_logs:
+        if fl["ResourceType"] == "VPC" and fl["LogStatus"] == "ACTIVE":
+            vpc_ids_with_flow_logs.add(fl["ResourceId"])
+
+    for vpc in store.vpcs:
+        vpc_name = vpc["VpcName"]
+        if vpc["VpcId"] in vpc_ids_with_flow_logs:
+            bp.append({
+                "Check": "VPC-FlowLogs",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": "VPC Flow Logs habilitados",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: Flow Logs activos", "OK")
+        else:
+            bp.append({
+                "Check": "VPC-FlowLogs",
+                "Resource": vpc_name,
+                "Status": "FAIL",
+                "Detail": "VPC no tiene Flow Logs habilitados — sin visibilidad de tráfico",
+                "Recommendation": (
+                    "Habilitar VPC Flow Logs hacia CloudWatch Logs o S3 "
+                    "para auditoría y troubleshooting de red"
+                ),
+            })
+            write_status(f"  ✗ {vpc_name}: Sin Flow Logs", "ERROR")
+
+    # ── CHECK B2: Segmentación de subnets (público vs privado) ───────────
+    write_status("\n[CHECK B2] Validando segmentación público/privado por VPC...")
+
+    for vpc in store.vpcs:
+        vpc_id = vpc["VpcId"]
+        vpc_name = vpc["VpcName"]
+        vpc_subnets = [sn for sn in store.subnets if sn["VpcId"] == vpc_id]
+
+        if not vpc_subnets:
+            continue
+
+        public_sn = [sn for sn in vpc_subnets if sn.get("MapPublicIp")]
+        private_sn = [sn for sn in vpc_subnets if not sn.get("MapPublicIp")]
+
+        if public_sn and private_sn:
+            bp.append({
+                "Check": "Subnet-Segmentation",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": f"{len(public_sn)} públicas + {len(private_sn)} privadas — segmentación correcta",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: {len(public_sn)} públicas + {len(private_sn)} privadas", "OK")
+        elif public_sn and not private_sn:
+            bp.append({
+                "Check": "Subnet-Segmentation",
+                "Resource": vpc_name,
+                "Status": "FAIL",
+                "Detail": f"Todas las {len(public_sn)} subnets son públicas (MapPublicIp=true) — sin segmentación",
+                "Recommendation": (
+                    "Crear subnets privadas para workloads que no requieren IP pública. "
+                    "Backends, bases de datos y servicios internos no deben exponerse a internet"
+                ),
+            })
+            write_status(f"  ✗ {vpc_name}: Todas las subnets son públicas ({len(public_sn)})", "ERROR")
+        elif private_sn and not public_sn:
+            bp.append({
+                "Check": "Subnet-Segmentation",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": f"Todas las {len(private_sn)} subnets son privadas",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: Todas privadas ({len(private_sn)})", "OK")
+
+    # ── CHECK B3: Uso de Default VPC ─────────────────────────────────────
+    write_status("\n[CHECK B3] Detectando uso de Default VPC...")
+
+    for vpc in store.vpcs:
+        vpc_name = vpc["VpcName"]
+        if vpc.get("IsDefault"):
+            bp.append({
+                "Check": "Default-VPC",
+                "Resource": vpc_name,
+                "Status": "WARNING",
+                "Detail": "Esta es una Default VPC creada automáticamente por AWS",
+                "Recommendation": (
+                    "No usar la Default VPC para workloads de producción. "
+                    "Crear VPCs personalizadas con CIDRs planificados, "
+                    "subnets públicas/privadas y route tables dedicadas"
+                ),
+            })
+            write_status(f"  ⚠ {vpc_name}: Default VPC", "WARN")
+        else:
+            bp.append({
+                "Check": "Default-VPC",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": "VPC personalizada (no default)",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: VPC personalizada", "OK")
+
+    # ── CHECK B4: Inspección centralizada de tráfico ─────────────────────
+    write_status("\n[CHECK B4] Validando existencia de inspección de tráfico...")
+
+    if store.network_firewalls:
+        bp.append({
+            "Check": "Traffic-Inspection",
+            "Resource": "Global",
+            "Status": "PASS",
+            "Detail": f"{len(store.network_firewalls)} Network Firewall(s) desplegado(s)",
+            "Recommendation": "N/A",
+        })
+        write_status(f"  ✓ {len(store.network_firewalls)} Network Firewall(s) detectado(s)", "OK")
+    else:
+        bp.append({
+            "Check": "Traffic-Inspection",
+            "Resource": "Global",
+            "Status": "FAIL",
+            "Detail": "No se detectó AWS Network Firewall en ninguna VPC",
+            "Recommendation": (
+                "Desplegar AWS Network Firewall en la VPC de inspección/Hub "
+                "para filtrar tráfico inter-VPC y hacia internet. "
+                "Configurar políticas de dominio, IPS/IDS y reglas stateful"
+            ),
+        })
+        write_status("  ✗ Sin Network Firewall en ninguna VPC", "ERROR")
+
+    # ── CHECK B5: DNS Resolver centralizado ──────────────────────────────
+    write_status("\n[CHECK B5] Validando resolución DNS centralizada...")
+
+    if store.r53_resolver_endpoints:
+        inbound = [e for e in store.r53_resolver_endpoints if e["Direction"] == "INBOUND"]
+        outbound = [e for e in store.r53_resolver_endpoints if e["Direction"] == "OUTBOUND"]
+        bp.append({
+            "Check": "DNS-Resolver",
+            "Resource": "Global",
+            "Status": "PASS",
+            "Detail": f"Route 53 Resolver: {len(inbound)} inbound + {len(outbound)} outbound endpoints",
+            "Recommendation": "N/A",
+        })
+        write_status(f"  ✓ R53 Resolver: {len(inbound)} inbound + {len(outbound)} outbound", "OK")
+    else:
+        bp.append({
+            "Check": "DNS-Resolver",
+            "Resource": "Global",
+            "Status": "WARNING",
+            "Detail": "No se detectaron Route 53 Resolver Endpoints",
+            "Recommendation": (
+                "Implementar Route 53 Resolver Inbound/Outbound endpoints "
+                "para resolución DNS consistente entre on-premises y AWS, "
+                "especialmente con Private Hosted Zones y VPC endpoints"
+            ),
+        })
+        write_status("  ⚠ Sin R53 Resolver Endpoints", "WARN")
+
+    # ── CHECK B6: Egress path para subnets privadas ──────────────────────
+    write_status("\n[CHECK B6] Validando ruta de egress (NAT Gateway) por VPC...")
+
+    for vpc in store.vpcs:
+        vpc_id = vpc["VpcId"]
+        vpc_name = vpc["VpcName"]
+        vpc_subnets = [sn for sn in store.subnets if sn["VpcId"] == vpc_id]
+        has_private = any(not sn.get("MapPublicIp") for sn in vpc_subnets)
+        vpc_nats = [n for n in store.nat_gateways if n["VpcId"] == vpc_id and n["State"] == "available"]
+
+        if has_private and vpc_nats:
+            bp.append({
+                "Check": "NAT-Egress",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": f"{len(vpc_nats)} NAT Gateway(s) — subnets privadas tienen ruta de salida",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: {len(vpc_nats)} NAT(s) para subnets privadas", "OK")
+        elif has_private and not vpc_nats:
+            bp.append({
+                "Check": "NAT-Egress",
+                "Resource": vpc_name,
+                "Status": "FAIL",
+                "Detail": "VPC tiene subnets privadas pero ningún NAT Gateway",
+                "Recommendation": (
+                    "Desplegar NAT Gateway en al menos 2 AZs para que las subnets "
+                    "privadas tengan salida a internet (actualizaciones, APIs externas)"
+                ),
+            })
+            write_status(f"  ✗ {vpc_name}: Subnets privadas sin NAT Gateway", "ERROR")
+        elif not has_private and not vpc_nats:
+            bp.append({
+                "Check": "NAT-Egress",
+                "Resource": vpc_name,
+                "Status": "WARNING",
+                "Detail": "VPC sin subnets privadas ni NAT — todo tráfico es directo a internet",
+                "Recommendation": (
+                    "Crear subnets privadas con NAT Gateway para workloads que no "
+                    "necesitan exposición directa a internet"
+                ),
+            })
+            write_status(f"  ⚠ {vpc_name}: Sin subnets privadas ni NAT", "WARN")
+
+    # ── CHECK B7: Route Tables personalizadas ────────────────────────────
+    write_status("\n[CHECK B7] Validando route tables personalizadas...")
+
+    for vpc in store.vpcs:
+        vpc_id = vpc["VpcId"]
+        vpc_name = vpc["VpcName"]
+        vpc_rts = [rt for rt in store.route_tables if rt["VpcId"] == vpc_id]
+        custom_rts = [rt for rt in vpc_rts if not rt["IsMain"]]
+
+        if custom_rts:
+            bp.append({
+                "Check": "Custom-RouteTables",
+                "Resource": vpc_name,
+                "Status": "PASS",
+                "Detail": f"{len(custom_rts)} route table(s) personalizadas + 1 main",
+                "Recommendation": "N/A",
+            })
+            write_status(f"  ✓ {vpc_name}: {len(custom_rts)} RT(s) custom", "OK")
+        else:
+            bp.append({
+                "Check": "Custom-RouteTables",
+                "Resource": vpc_name,
+                "Status": "WARNING",
+                "Detail": "Solo tiene la main route table por defecto — sin control granular de enrutamiento",
+                "Recommendation": (
+                    "Crear route tables dedicadas por tipo de subnet (pública, privada, "
+                    "aislada) para controlar el flujo de tráfico de forma granular"
+                ),
+            })
+            write_status(f"  ⚠ {vpc_name}: Solo main route table", "WARN")
 
     # ── Resumen ──
     pass_count = sum(1 for b in bp if b["Status"] == "PASS")
@@ -1826,6 +2087,7 @@ def export_all(store: DiscoveryStore, mermaid_content: str, output_path: str) ->
             ("Network Firewalls", store.network_firewalls, _HEADER_FILL_RED, set()),
             ("R53 Resolver", store.r53_resolver_endpoints, _HEADER_FILL_TEAL, set()),
             ("NAT Gateways", store.nat_gateways, _HEADER_FILL_TEAL, set()),
+            ("VPC Flow Logs", store.flow_logs, _HEADER_FILL_GRAY, set()),
         ]
 
         for sheet_name, data, fill, exclude in sheets_config:
@@ -1858,6 +2120,7 @@ def export_all(store: DiscoveryStore, mermaid_content: str, output_path: str) ->
         export_csv(store.network_firewalls, os.path.join(output_path, "inventory-network-firewalls.csv"), "Network Firewalls")
         export_csv(store.r53_resolver_endpoints, os.path.join(output_path, "inventory-r53-resolver.csv"), "R53 Resolver")
         export_csv(store.nat_gateways, os.path.join(output_path, "inventory-nat-gateways.csv"), "NAT Gateways")
+        export_csv(store.flow_logs, os.path.join(output_path, "inventory-flow-logs.csv"), "Flow Logs")
         bp_path = os.path.join(output_path, "best-practices-report.csv")
         export_csv(store.best_practices, bp_path, "Best Practices")
         files["best_practices_csv"] = bp_path
