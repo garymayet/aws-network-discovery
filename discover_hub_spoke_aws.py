@@ -91,7 +91,7 @@ except ImportError:
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 DEFAULT_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "eu-central-1", "sa-east-1",
@@ -1515,9 +1515,49 @@ def generate_mermaid(store: DiscoveryStore) -> str:
     lines.append("    classDef onpremStyle fill:#607d8b,stroke:#263238,stroke-width:2px,color:#fff")
     lines.append("    classDef dxStyle fill:#4caf50,stroke:#1b5e20,stroke-width:2px,color:#fff")
     lines.append("    classDef standaloneStyle fill:#78909c,stroke:#37474f,stroke-width:2px,color:#fff")
+    lines.append("    classDef azStyle fill:#eceff1,stroke:#90a4ae,stroke-width:1px,color:#37474f")
     lines.append("")
 
     hub_vpc_ids = {v["VpcId"] for v in store.vpcs if v["IsHub"]}
+
+    def _render_subnets(lines_ref, parent_id, vpc_id, store_ref, indent="        "):
+        """Renderiza subnets de un VPC agrupadas por AZ con CIDRs completos."""
+        vpc_subnets = [sn for sn in store_ref.subnets if sn["VpcId"] == vpc_id]
+        if not vpc_subnets:
+            return
+
+        # Agrupar por AZ
+        az_map = defaultdict(list)
+        for sn in vpc_subnets:
+            az_map[sn["AvailabilityZone"]].append(sn)
+
+        for az in sorted(az_map.keys()):
+            sn_list = az_map[az]
+            az_short = az.split("-")[-1] if "-" in az else az  # "us-east-2a" → "2a"
+            az_id = sanitize_mermaid_id(f"{vpc_id}_az_{az}")
+
+            # Subgrafo por AZ
+            lines_ref.append(f'{indent}subgraph {az_id}["{az}"]')
+
+            for sn in sn_list:
+                sn_id = sanitize_mermaid_id(f"{vpc_id}_{sn['SubnetId']}")
+                pub_label = " PUB" if sn.get("MapPublicIp") else " PRIV"
+                sn_name = sn["SubnetName"]
+                # Truncar nombre si es muy largo (IDs de AWS)
+                if len(sn_name) > 24:
+                    sn_name = sn_name[:12] + "..." + sn_name[-8:]
+                lines_ref.append(
+                    f'{indent}    {sn_id}["📂 {sn_name}<br/>'
+                    f'{sn["CidrBlock"]}{pub_label}"]'
+                )
+
+            lines_ref.append(f'{indent}end')
+            # Conectar AZ al nodo padre
+            lines_ref.append(f'{indent}{parent_id} --- {az_id}')
+        # Aplicar estilo a subgrafos AZ
+        for az in sorted(az_map.keys()):
+            az_id = sanitize_mermaid_id(f"{vpc_id}_az_{az}")
+            lines_ref.append(f'{indent}style {az_id} fill:#eceff1,stroke:#90a4ae,stroke-width:1px,color:#37474f')
 
     # ── Nodo On-Premises (si hay VPN o DX) ──
     has_onprem = (
@@ -1547,11 +1587,15 @@ def generate_mermaid(store: DiscoveryStore) -> str:
         hub_id = sanitize_mermaid_id(hub["VpcId"])
         hub_label = hub["VpcName"]
         cidr = hub["CidrBlock"]
+        extra_cidrs = hub.get("AdditionalCidrs", "")
+        cidr_label = cidr
+        if extra_cidrs:
+            cidr_label += f"<br/>{extra_cidrs}"
         lines.append(f"    %% ── Hub: {hub_label} ──")
         lines.append(f'    subgraph {hub_id}_sub["🔷 HUB: {hub_label}"]')
         lines.append("        direction TB")
         lines.append(
-            f'        {hub_id}["📡 {hub_label}<br/>{cidr}<br/>{hub["Region"]}"]:::hubStyle'
+            f'        {hub_id}["📡 {hub_label}<br/>{cidr_label}<br/>{hub["Region"]}"]:::hubStyle'
         )
 
         # Network Firewalls
@@ -1605,6 +1649,9 @@ def generate_mermaid(store: DiscoveryStore) -> str:
                 )
                 lines.append(f"        {hub_id} --- {vgw_id}")
 
+        # Subnets del Hub (agrupadas por AZ)
+        _render_subnets(lines, hub_id, hub["VpcId"], store)
+
         lines.append("    end")
         lines.append("")
 
@@ -1613,27 +1660,18 @@ def generate_mermaid(store: DiscoveryStore) -> str:
         spoke_id = sanitize_mermaid_id(spoke["VpcId"])
         spoke_label = spoke["VpcName"]
         cidr = spoke["CidrBlock"]
+        extra_cidrs = spoke.get("AdditionalCidrs", "")
+        cidr_label = cidr
+        if extra_cidrs:
+            cidr_label += f"<br/>{extra_cidrs}"
         lines.append(f"    %% ── Spoke: {spoke_label} ──")
         lines.append(f'    subgraph {spoke_id}_sub["🟢 SPOKE: {spoke_label}"]')
         lines.append(
-            f'        {spoke_id}["🖥️ {spoke_label}<br/>{cidr}<br/>{spoke["Region"]}"]:::spokeStyle'
+            f'        {spoke_id}["🖥️ {spoke_label}<br/>{cidr_label}<br/>{spoke["Region"]}"]:::spokeStyle'
         )
 
-        # Subnets del Spoke (limitar a 5 por legibilidad)
-        spoke_subnets = [
-            sn for sn in store.subnets if sn["VpcId"] == spoke["VpcId"]
-        ]
-        if 0 < len(spoke_subnets) <= 5:
-            for sn in spoke_subnets:
-                sn_id = sanitize_mermaid_id(f"{spoke['VpcId']}_{sn['SubnetId']}")
-                lines.append(
-                    f'        {sn_id}["📂 {sn["SubnetName"]}<br/>{sn["CidrBlock"]}"]'
-                )
-                lines.append(f"        {spoke_id} --- {sn_id}")
-        elif len(spoke_subnets) > 5:
-            sn_summary = f"{spoke_id}_sn"
-            lines.append(f'        {sn_summary}["📂 {len(spoke_subnets)} subnets"]')
-            lines.append(f"        {spoke_id} --- {sn_summary}")
+        # Subnets del Spoke (agrupadas por AZ)
+        _render_subnets(lines, spoke_id, spoke["VpcId"], store)
 
         lines.append("    end")
         lines.append("")
@@ -1646,35 +1684,21 @@ def generate_mermaid(store: DiscoveryStore) -> str:
             vpc_id = sanitize_mermaid_id(vpc["VpcId"])
             vpc_label = vpc["VpcName"]
             cidr = vpc["CidrBlock"]
+            extra_cidrs = vpc.get("AdditionalCidrs", "")
+            cidr_label = cidr
+            if extra_cidrs:
+                cidr_label += f"<br/>{extra_cidrs}"
             default_tag = " [Default]" if vpc.get("IsDefault") else ""
             lines.append(f"    %% ── Standalone: {vpc_label} ──")
             lines.append(f'    subgraph {vpc_id}_sub["⬜ VPC: {vpc_label}{default_tag}"]')
             lines.append("        direction TB")
             lines.append(
-                f'        {vpc_id}["🖥️ {vpc_label}<br/>{cidr}<br/>'
+                f'        {vpc_id}["🖥️ {vpc_label}<br/>{cidr_label}<br/>'
                 f'{vpc["Region"]}{default_tag}"]:::standaloneStyle'
             )
 
-            # Subnets
-            vpc_subnets = [sn for sn in store.subnets if sn["VpcId"] == vpc["VpcId"]]
-            if 0 < len(vpc_subnets) <= 6:
-                for sn in vpc_subnets:
-                    sn_id = sanitize_mermaid_id(f"{vpc['VpcId']}_{sn['SubnetId']}")
-                    pub_label = " 🌐" if sn.get("MapPublicIp") else ""
-                    lines.append(
-                        f'        {sn_id}["📂 {sn["SubnetName"]}<br/>'
-                        f'{sn["CidrBlock"]}<br/>{sn["AvailabilityZone"]}{pub_label}"]'
-                    )
-                    lines.append(f"        {vpc_id} --- {sn_id}")
-            elif len(vpc_subnets) > 6:
-                sn_summary = f"{vpc_id}_sn"
-                # Agrupar por AZ
-                azs = set(sn["AvailabilityZone"] for sn in vpc_subnets)
-                lines.append(
-                    f'        {sn_summary}["📂 {len(vpc_subnets)} subnets<br/>'
-                    f'{len(azs)} AZs"]'
-                )
-                lines.append(f"        {vpc_id} --- {sn_summary}")
+            # Subnets (agrupadas por AZ con CIDRs)
+            _render_subnets(lines, vpc_id, vpc["VpcId"], store)
 
             # NAT Gateways
             vpc_nats = [
