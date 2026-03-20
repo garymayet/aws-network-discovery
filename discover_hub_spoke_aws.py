@@ -66,14 +66,32 @@ try:
     from openpyxl.utils import get_column_letter
     HAS_OPENPYXL = True
 except ImportError:
-    HAS_OPENPYXL = False
+    print("[INFO ] openpyxl no encontrado. Instalando automáticamente...")
+    import subprocess
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "openpyxl", "--quiet",
+             "--disable-pip-version-check", "--no-warn-script-location"],
+            stdout=subprocess.DEVNULL,
+        )
+        from openpyxl import Workbook
+        from openpyxl.styles import (
+            Font, PatternFill, Alignment, Border, Side, numbers,
+        )
+        from openpyxl.utils import get_column_letter
+        HAS_OPENPYXL = True
+        print("[OK   ] openpyxl instalado correctamente.")
+    except Exception as e:
+        print(f"[WARN ] No se pudo instalar openpyxl: {e}")
+        print("[WARN ] La salida será en CSVs individuales en vez de Excel.")
+        HAS_OPENPYXL = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 DEFAULT_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "eu-central-1", "sa-east-1",
@@ -1547,42 +1565,46 @@ def export_csv(data: list[dict], filepath: str, description: str) -> None:
 
 # ── Estilos Excel reutilizables ──────────────────────────────────────────
 
-_HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-_HEADER_FILL_BLUE = PatternFill("solid", fgColor="1A73E8")
-_HEADER_FILL_GREEN = PatternFill("solid", fgColor="34A853")
-_HEADER_FILL_RED = PatternFill("solid", fgColor="EA4335")
-_HEADER_FILL_ORANGE = PatternFill("solid", fgColor="FF6D00")
-_HEADER_FILL_GRAY = PatternFill("solid", fgColor="455A64")
-_HEADER_FILL_PURPLE = PatternFill("solid", fgColor="7B1FA2")
-_HEADER_FILL_TEAL = PatternFill("solid", fgColor="00838F")
-_HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="center", wrap_text=True)
-_CELL_FONT = Font(name="Arial", size=10)
-_CELL_ALIGNMENT = Alignment(vertical="top", wrap_text=True)
-_THIN_BORDER = Border(
-    left=Side(style="thin", color="D0D0D0"),
-    right=Side(style="thin", color="D0D0D0"),
-    top=Side(style="thin", color="D0D0D0"),
-    bottom=Side(style="thin", color="D0D0D0"),
-)
-_PASS_FILL = PatternFill("solid", fgColor="E8F5E9")
-_FAIL_FILL = PatternFill("solid", fgColor="FFEBEE")
-_WARN_FILL = PatternFill("solid", fgColor="FFF8E1")
-_PASS_FONT = Font(name="Arial", size=10, bold=True, color="1B5E20")
-_FAIL_FONT = Font(name="Arial", size=10, bold=True, color="B71C1C")
-_WARN_FONT = Font(name="Arial", size=10, bold=True, color="E65100")
+if HAS_OPENPYXL:
+    _HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    _HEADER_FILL_BLUE = PatternFill("solid", fgColor="1A73E8")
+    _HEADER_FILL_GREEN = PatternFill("solid", fgColor="34A853")
+    _HEADER_FILL_RED = PatternFill("solid", fgColor="EA4335")
+    _HEADER_FILL_ORANGE = PatternFill("solid", fgColor="FF6D00")
+    _HEADER_FILL_GRAY = PatternFill("solid", fgColor="455A64")
+    _HEADER_FILL_PURPLE = PatternFill("solid", fgColor="7B1FA2")
+    _HEADER_FILL_TEAL = PatternFill("solid", fgColor="00838F")
+    _HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    _CELL_FONT = Font(name="Arial", size=10)
+    _CELL_ALIGNMENT = Alignment(vertical="top", wrap_text=True)
+    _THIN_BORDER = Border(
+        left=Side(style="thin", color="D0D0D0"),
+        right=Side(style="thin", color="D0D0D0"),
+        top=Side(style="thin", color="D0D0D0"),
+        bottom=Side(style="thin", color="D0D0D0"),
+    )
+    _PASS_FILL = PatternFill("solid", fgColor="E8F5E9")
+    _FAIL_FILL = PatternFill("solid", fgColor="FFEBEE")
+    _WARN_FILL = PatternFill("solid", fgColor="FFF8E1")
+    _PASS_FONT = Font(name="Arial", size=10, bold=True, color="1B5E20")
+    _FAIL_FONT = Font(name="Arial", size=10, bold=True, color="B71C1C")
+    _WARN_FONT = Font(name="Arial", size=10, bold=True, color="E65100")
 
 
 def _add_sheet_from_data(
     wb: "Workbook",
     sheet_name: str,
     data: list[dict],
-    header_fill: PatternFill = _HEADER_FILL_BLUE,
+    header_fill=None,
     exclude_keys: set = None,
     is_best_practices: bool = False,
 ) -> None:
     """Agrega una hoja al workbook con datos, encabezados formateados y auto-width."""
     if not data:
         return
+
+    if header_fill is None:
+        header_fill = _HEADER_FILL_BLUE
 
     exclude_keys = exclude_keys or set()
     fieldnames = [k for k in data[0].keys() if k not in exclude_keys]
