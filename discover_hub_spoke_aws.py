@@ -58,12 +58,22 @@ except ImportError:
     print("[ERROR] boto3 no está instalado. Ejecutar: pip install boto3")
     sys.exit(1)
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import (
+        Font, PatternFill, Alignment, Border, Side, numbers,
+    )
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.1.0"
 DEFAULT_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "eu-central-1", "sa-east-1",
@@ -1225,6 +1235,7 @@ def generate_mermaid(store: DiscoveryStore) -> str:
     lines.append("    classDef natStyle fill:#00bcd4,stroke:#006064,stroke-width:2px,color:#fff")
     lines.append("    classDef onpremStyle fill:#607d8b,stroke:#263238,stroke-width:2px,color:#fff")
     lines.append("    classDef dxStyle fill:#4caf50,stroke:#1b5e20,stroke-width:2px,color:#fff")
+    lines.append("    classDef standaloneStyle fill:#78909c,stroke:#37474f,stroke-width:2px,color:#fff")
     lines.append("")
 
     hub_vpc_ids = {v["VpcId"] for v in store.vpcs if v["IsHub"]}
@@ -1348,6 +1359,80 @@ def generate_mermaid(store: DiscoveryStore) -> str:
         lines.append("    end")
         lines.append("")
 
+    # ── Subgrafos VPCs sin clasificar (ni Hub ni Spoke) ──
+    unclassified_vpcs = [v for v in store.vpcs if not v["IsHub"] and not v["IsSpoke"]]
+    if unclassified_vpcs:
+        lines.append("    %% ═══ VPCs sin clasificar (Standalone) ═══")
+        for vpc in unclassified_vpcs:
+            vpc_id = sanitize_mermaid_id(vpc["VpcId"])
+            vpc_label = vpc["VpcName"]
+            cidr = vpc["CidrBlock"]
+            default_tag = " [Default]" if vpc.get("IsDefault") else ""
+            lines.append(f"    %% ── Standalone: {vpc_label} ──")
+            lines.append(f'    subgraph {vpc_id}_sub["⬜ VPC: {vpc_label}{default_tag}"]')
+            lines.append("        direction TB")
+            lines.append(
+                f'        {vpc_id}["🖥️ {vpc_label}<br/>{cidr}<br/>'
+                f'{vpc["Region"]}{default_tag}"]:::standaloneStyle'
+            )
+
+            # Subnets
+            vpc_subnets = [sn for sn in store.subnets if sn["VpcId"] == vpc["VpcId"]]
+            if 0 < len(vpc_subnets) <= 6:
+                for sn in vpc_subnets:
+                    sn_id = sanitize_mermaid_id(f"{vpc['VpcId']}_{sn['SubnetId']}")
+                    pub_label = " 🌐" if sn.get("MapPublicIp") else ""
+                    lines.append(
+                        f'        {sn_id}["📂 {sn["SubnetName"]}<br/>'
+                        f'{sn["CidrBlock"]}<br/>{sn["AvailabilityZone"]}{pub_label}"]'
+                    )
+                    lines.append(f"        {vpc_id} --- {sn_id}")
+            elif len(vpc_subnets) > 6:
+                sn_summary = f"{vpc_id}_sn"
+                # Agrupar por AZ
+                azs = set(sn["AvailabilityZone"] for sn in vpc_subnets)
+                lines.append(
+                    f'        {sn_summary}["📂 {len(vpc_subnets)} subnets<br/>'
+                    f'{len(azs)} AZs"]'
+                )
+                lines.append(f"        {vpc_id} --- {sn_summary}")
+
+            # NAT Gateways
+            vpc_nats = [
+                n for n in store.nat_gateways
+                if n["VpcId"] == vpc["VpcId"] and n["State"] == "available"
+            ]
+            for nat in vpc_nats:
+                nat_id = sanitize_mermaid_id(nat["NatGatewayId"])
+                lines.append(
+                    f'        {nat_id}["🌊 NAT<br/>{nat["NatGatewayName"]}<br/>'
+                    f'{nat["PublicIPs"]}"]:::natStyle'
+                )
+                lines.append(f"        {vpc_id} --- {nat_id}")
+
+            # VGWs
+            for vgw in store.vgws:
+                if vpc["VpcId"] in vgw["AttachedVpcs"]:
+                    vgw_id = sanitize_mermaid_id(vgw["VgwId"])
+                    lines.append(
+                        f'        {vgw_id}["🔒 VGW: {vgw["VgwName"]}<br/>'
+                        f'ASN: {vgw["AmazonSideAsn"]}"]:::vpnStyle'
+                    )
+                    lines.append(f"        {vpc_id} --- {vgw_id}")
+
+            # R53 Resolver Endpoints
+            for ep in store.r53_resolver_endpoints:
+                if ep["VpcId"] == vpc["VpcId"]:
+                    ep_id = sanitize_mermaid_id(ep["EndpointId"])
+                    lines.append(
+                        f'        {ep_id}["🌐 {ep["EndpointName"]}<br/>'
+                        f'R53 {ep["Direction"]}"]:::dnsStyle'
+                    )
+                    lines.append(f"        {vpc_id} --- {ep_id}")
+
+            lines.append("    end")
+            lines.append("")
+
     # ── Conexiones TGW ↔ VPC ──
     lines.append("    %% ═══ TGW Attachments ═══")
     for att in store.tgw_attachments:
@@ -1444,11 +1529,10 @@ def generate_mermaid(store: DiscoveryStore) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def export_csv(data: list[dict], filepath: str, description: str) -> None:
-    """Exporta una lista de diccionarios a un archivo CSV."""
+    """Exporta una lista de diccionarios a un archivo CSV (fallback si no hay openpyxl)."""
     if not data:
         write_status(f"  {description}: Sin datos, omitiendo", "WARN")
         return
-    # Filtrar keys internas
     exclude_keys = {"HubReasons"}
     fieldnames = [k for k in data[0].keys() if k not in exclude_keys]
     try:
@@ -1461,8 +1545,226 @@ def export_csv(data: list[dict], filepath: str, description: str) -> None:
         write_status(f"  Error exportando {filepath}: {e}", "ERROR")
 
 
+# ── Estilos Excel reutilizables ──────────────────────────────────────────
+
+_HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+_HEADER_FILL_BLUE = PatternFill("solid", fgColor="1A73E8")
+_HEADER_FILL_GREEN = PatternFill("solid", fgColor="34A853")
+_HEADER_FILL_RED = PatternFill("solid", fgColor="EA4335")
+_HEADER_FILL_ORANGE = PatternFill("solid", fgColor="FF6D00")
+_HEADER_FILL_GRAY = PatternFill("solid", fgColor="455A64")
+_HEADER_FILL_PURPLE = PatternFill("solid", fgColor="7B1FA2")
+_HEADER_FILL_TEAL = PatternFill("solid", fgColor="00838F")
+_HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_CELL_FONT = Font(name="Arial", size=10)
+_CELL_ALIGNMENT = Alignment(vertical="top", wrap_text=True)
+_THIN_BORDER = Border(
+    left=Side(style="thin", color="D0D0D0"),
+    right=Side(style="thin", color="D0D0D0"),
+    top=Side(style="thin", color="D0D0D0"),
+    bottom=Side(style="thin", color="D0D0D0"),
+)
+_PASS_FILL = PatternFill("solid", fgColor="E8F5E9")
+_FAIL_FILL = PatternFill("solid", fgColor="FFEBEE")
+_WARN_FILL = PatternFill("solid", fgColor="FFF8E1")
+_PASS_FONT = Font(name="Arial", size=10, bold=True, color="1B5E20")
+_FAIL_FONT = Font(name="Arial", size=10, bold=True, color="B71C1C")
+_WARN_FONT = Font(name="Arial", size=10, bold=True, color="E65100")
+
+
+def _add_sheet_from_data(
+    wb: "Workbook",
+    sheet_name: str,
+    data: list[dict],
+    header_fill: PatternFill = _HEADER_FILL_BLUE,
+    exclude_keys: set = None,
+    is_best_practices: bool = False,
+) -> None:
+    """Agrega una hoja al workbook con datos, encabezados formateados y auto-width."""
+    if not data:
+        return
+
+    exclude_keys = exclude_keys or set()
+    fieldnames = [k for k in data[0].keys() if k not in exclude_keys]
+
+    ws = wb.create_sheet(title=sheet_name[:31])  # Excel limita a 31 chars
+
+    # Encabezados
+    for col_idx, header in enumerate(fieldnames, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = _HEADER_FONT
+        cell.fill = header_fill
+        cell.alignment = _HEADER_ALIGNMENT
+        cell.border = _THIN_BORDER
+
+    # Datos
+    for row_idx, record in enumerate(data, 2):
+        for col_idx, key in enumerate(fieldnames, 1):
+            value = record.get(key, "")
+            # Convertir listas a string
+            if isinstance(value, (list, tuple)):
+                value = ", ".join(str(v) for v in value)
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = _CELL_FONT
+            cell.alignment = _CELL_ALIGNMENT
+            cell.border = _THIN_BORDER
+
+            # Colorear filas de Best Practices según Status
+            if is_best_practices and key == "Status":
+                if value == "PASS":
+                    cell.font = _PASS_FONT
+                    cell.fill = _PASS_FILL
+                elif value == "FAIL":
+                    cell.font = _FAIL_FONT
+                    cell.fill = _FAIL_FILL
+                elif value in ("WARNING", "WARN"):
+                    cell.font = _WARN_FONT
+                    cell.fill = _WARN_FILL
+
+    # Auto-fit column widths
+    for col_idx, key in enumerate(fieldnames, 1):
+        max_len = len(str(key))
+        for row_idx in range(2, min(len(data) + 2, 102)):  # Muestrear hasta 100 filas
+            val = str(data[row_idx - 2].get(key, ""))
+            max_len = max(max_len, min(len(val), 60))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+
+    # Filtros automáticos
+    ws.auto_filter.ref = ws.dimensions
+
+    # Congelar encabezado
+    ws.freeze_panes = "A2"
+
+
+def _add_summary_sheet(wb: "Workbook", store: "DiscoveryStore") -> None:
+    """Agrega la hoja de resumen ejecutivo como primera pestaña."""
+    ws = wb.create_sheet(title="Resumen", index=0)
+
+    # Título
+    ws.merge_cells("A1:D1")
+    title_cell = ws["A1"]
+    title_cell.value = "AWS Hub & Spoke — Resumen Arquitectónico"
+    title_cell.font = Font(name="Arial", bold=True, size=14, color="1A73E8")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Subtítulo
+    ws.merge_cells("A2:D2")
+    sub_cell = ws["A2"]
+    sub_cell.value = f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} — discover_hub_spoke_aws.py v{SCRIPT_VERSION}"
+    sub_cell.font = Font(name="Arial", size=9, italic=True, color="666666")
+    sub_cell.alignment = Alignment(horizontal="center")
+
+    row = 4
+    # Inventario general
+    ws.cell(row=row, column=1, value="INVENTARIO GENERAL").font = Font(name="Arial", bold=True, size=11, color="1A73E8")
+    row += 1
+
+    summary = store.summary()
+    accounts = list(set(v["AccountId"] for v in store.vpcs)) if store.vpcs else []
+    regions = list(set(v["Region"] for v in store.vpcs)) if store.vpcs else []
+
+    summary_data = [
+        ("Cuentas analizadas", len(accounts)),
+        ("Regiones", ", ".join(regions) if regions else "N/A"),
+    ]
+    summary_data.extend(summary.items())
+
+    for metric, value in summary_data:
+        ws.cell(row=row, column=1, value=metric).font = Font(name="Arial", size=10)
+        ws.cell(row=row, column=1).border = _THIN_BORDER
+        val_cell = ws.cell(row=row, column=2, value=value)
+        val_cell.font = Font(name="Arial", size=10, bold=True)
+        val_cell.border = _THIN_BORDER
+        row += 1
+
+    row += 1
+
+    # Topología
+    hub_count = sum(1 for v in store.vpcs if v["IsHub"])
+    spoke_count = sum(1 for v in store.vpcs if v["IsSpoke"])
+    unclass_count = sum(1 for v in store.vpcs if not v["IsHub"] and not v["IsSpoke"])
+
+    ws.cell(row=row, column=1, value="TOPOLOGÍA").font = Font(name="Arial", bold=True, size=11, color="1A73E8")
+    row += 1
+    for label, count, color in [
+        ("Hubs", hub_count, "1A73E8"),
+        ("Spokes", spoke_count, "34A853"),
+        ("Sin clasificar", unclass_count, "78909C"),
+    ]:
+        ws.cell(row=row, column=1, value=label).font = Font(name="Arial", size=10)
+        ws.cell(row=row, column=1).border = _THIN_BORDER
+        c = ws.cell(row=row, column=2, value=count)
+        c.font = Font(name="Arial", size=10, bold=True, color=color)
+        c.border = _THIN_BORDER
+        row += 1
+
+    row += 1
+
+    # Best Practices resumen
+    bp = store.best_practices
+    pass_c = sum(1 for b in bp if b["Status"] == "PASS")
+    fail_c = sum(1 for b in bp if b["Status"] == "FAIL")
+    warn_c = sum(1 for b in bp if b["Status"] in ("WARNING", "WARN"))
+
+    ws.cell(row=row, column=1, value="AUDITORÍA DE MEJORES PRÁCTICAS").font = Font(name="Arial", bold=True, size=11, color="1A73E8")
+    row += 1
+    for label, count, fill, font in [
+        ("PASS", pass_c, _PASS_FILL, _PASS_FONT),
+        ("FAIL", fail_c, _FAIL_FILL, _FAIL_FONT),
+        ("WARNING", warn_c, _WARN_FILL, _WARN_FONT),
+    ]:
+        ws.cell(row=row, column=1, value=label).font = font
+        ws.cell(row=row, column=1).fill = fill
+        ws.cell(row=row, column=1).border = _THIN_BORDER
+        c = ws.cell(row=row, column=2, value=count)
+        c.font = Font(name="Arial", size=10, bold=True)
+        c.border = _THIN_BORDER
+        row += 1
+
+    # Hubs detalle
+    if hub_count > 0:
+        row += 1
+        ws.cell(row=row, column=1, value="DETALLE DE HUBS").font = Font(name="Arial", bold=True, size=11, color="1A73E8")
+        row += 1
+        for hub in [v for v in store.vpcs if v["IsHub"]]:
+            ws.cell(row=row, column=1, value=hub["VpcName"]).font = Font(name="Arial", size=10, bold=True)
+            ws.cell(row=row, column=2, value=hub["VpcId"]).font = Font(name="Arial", size=9, color="666666")
+            ws.cell(row=row, column=3, value=hub["CidrBlock"]).font = _CELL_FONT
+            ws.cell(row=row, column=4, value=hub["Region"]).font = _CELL_FONT
+            row += 1
+            reasons = hub.get("HubReasons", [])
+            if reasons:
+                ws.cell(row=row, column=2, value="Razones: " + "; ".join(reasons)).font = Font(name="Arial", size=9, italic=True, color="555555")
+                row += 1
+
+    # Column widths
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 18
+
+
+def _add_mermaid_sheet(wb: "Workbook", mermaid_content: str) -> None:
+    """Agrega una hoja con el código Mermaid.js para copiar."""
+    ws = wb.create_sheet(title="Diagrama Mermaid")
+
+    ws.merge_cells("A1:C1")
+    ws["A1"].value = "Diagrama Mermaid.js — Copiar y pegar en https://mermaid.live"
+    ws["A1"].font = Font(name="Arial", bold=True, size=11, color="1A73E8")
+
+    ws["A2"].value = "Seleccionar toda la columna A desde la fila 4 para copiar el código."
+    ws["A2"].font = Font(name="Arial", size=9, italic=True, color="666666")
+
+    for row_idx, line in enumerate(mermaid_content.split("\n"), 4):
+        cell = ws.cell(row=row_idx, column=1, value=line)
+        cell.font = Font(name="Consolas", size=9)
+
+    ws.column_dimensions["A"].width = 120
+
+
 def export_all(store: DiscoveryStore, mermaid_content: str, output_path: str) -> dict:
-    """Exporta todos los artefactos de salida."""
+    """Exporta todos los artefactos: libro Excel consolidado + Mermaid .mmd + Markdown."""
 
     write_status("\n═══════════════════════════════════════════════════════════")
     write_status("  Exportando resultados...")
@@ -1471,39 +1773,86 @@ def export_all(store: DiscoveryStore, mermaid_content: str, output_path: str) ->
     os.makedirs(output_path, exist_ok=True)
     files = {}
 
-    # ── CSVs de inventario ──
-    export_csv(store.vpcs, os.path.join(output_path, "inventory-vpcs.csv"), "Inventario VPCs")
-    export_csv(store.subnets, os.path.join(output_path, "inventory-subnets.csv"), "Inventario Subnets")
-    export_csv(store.route_tables, os.path.join(output_path, "inventory-route-tables.csv"), "Inventario Route Tables")
-    export_csv(store.tgws, os.path.join(output_path, "inventory-tgws.csv"), "Inventario TGWs")
-    export_csv(store.tgw_attachments, os.path.join(output_path, "inventory-tgw-attachments.csv"), "Inventario TGW Attachments")
-    export_csv(store.vpc_peerings, os.path.join(output_path, "inventory-vpc-peerings.csv"), "Inventario VPC Peerings")
-    export_csv(store.vgws, os.path.join(output_path, "inventory-vgws.csv"), "Inventario VGWs")
-    export_csv(store.cgws, os.path.join(output_path, "inventory-cgws.csv"), "Inventario Customer GWs")
-    export_csv(store.vpn_connections, os.path.join(output_path, "inventory-vpn-connections.csv"), "Inventario VPN Connections")
-    export_csv(store.dx_connections, os.path.join(output_path, "inventory-dx-connections.csv"), "Inventario Direct Connect")
-    export_csv(store.network_firewalls, os.path.join(output_path, "inventory-network-firewalls.csv"), "Inventario Network Firewalls")
-    export_csv(store.r53_resolver_endpoints, os.path.join(output_path, "inventory-r53-resolver.csv"), "Inventario R53 Resolver")
-    export_csv(store.nat_gateways, os.path.join(output_path, "inventory-nat-gateways.csv"), "Inventario NAT Gateways")
+    # ── Libro Excel consolidado ──
+    if HAS_OPENPYXL:
+        xlsx_path = os.path.join(output_path, "hub-spoke-discovery.xlsx")
+        wb = Workbook()
+        # Eliminar la hoja por defecto
+        wb.remove(wb.active)
 
-    # ── CSV de Best Practices ──
-    bp_path = os.path.join(output_path, "best-practices-report.csv")
-    export_csv(store.best_practices, bp_path, "Reporte Best Practices")
-    files["best_practices_csv"] = bp_path
+        # 1. Resumen ejecutivo
+        _add_summary_sheet(wb, store)
 
-    # ── Mermaid .mmd ──
+        # 2. Best Practices (con formato condicional por Status)
+        _add_sheet_from_data(
+            wb, "Best Practices", store.best_practices,
+            header_fill=_HEADER_FILL_RED, is_best_practices=True,
+        )
+
+        # 3-15. Hojas de inventario
+        sheets_config = [
+            ("VPCs", store.vpcs, _HEADER_FILL_BLUE, {"HubReasons"}),
+            ("Subnets", store.subnets, _HEADER_FILL_BLUE, set()),
+            ("Route Tables", store.route_tables, _HEADER_FILL_BLUE, set()),
+            ("Transit Gateways", store.tgws, _HEADER_FILL_ORANGE, set()),
+            ("TGW Attachments", store.tgw_attachments, _HEADER_FILL_ORANGE, set()),
+            ("VPC Peerings", store.vpc_peerings, _HEADER_FILL_GREEN, set()),
+            ("VGWs", store.vgws, _HEADER_FILL_PURPLE, set()),
+            ("Customer Gateways", store.cgws, _HEADER_FILL_PURPLE, set()),
+            ("VPN Connections", store.vpn_connections, _HEADER_FILL_PURPLE, set()),
+            ("Direct Connect", store.dx_connections, _HEADER_FILL_TEAL, set()),
+            ("Network Firewalls", store.network_firewalls, _HEADER_FILL_RED, set()),
+            ("R53 Resolver", store.r53_resolver_endpoints, _HEADER_FILL_TEAL, set()),
+            ("NAT Gateways", store.nat_gateways, _HEADER_FILL_TEAL, set()),
+        ]
+
+        for sheet_name, data, fill, exclude in sheets_config:
+            if data:
+                _add_sheet_from_data(wb, sheet_name, data, header_fill=fill, exclude_keys=exclude)
+                write_status(f"  Hoja '{sheet_name}': {len(data)} registros", "OK")
+            else:
+                write_status(f"  Hoja '{sheet_name}': Sin datos, omitiendo", "WARN")
+
+        # Hoja de Mermaid
+        _add_mermaid_sheet(wb, mermaid_content)
+
+        wb.save(xlsx_path)
+        write_status(f"  📊 Libro Excel: {xlsx_path}", "OK")
+        files["xlsx"] = xlsx_path
+
+    else:
+        write_status("  openpyxl no disponible — exportando CSVs individuales", "WARN")
+        write_status("  Para Excel: pip install openpyxl", "WARN")
+        export_csv(store.vpcs, os.path.join(output_path, "inventory-vpcs.csv"), "VPCs")
+        export_csv(store.subnets, os.path.join(output_path, "inventory-subnets.csv"), "Subnets")
+        export_csv(store.route_tables, os.path.join(output_path, "inventory-route-tables.csv"), "Route Tables")
+        export_csv(store.tgws, os.path.join(output_path, "inventory-tgws.csv"), "TGWs")
+        export_csv(store.tgw_attachments, os.path.join(output_path, "inventory-tgw-attachments.csv"), "TGW Attachments")
+        export_csv(store.vpc_peerings, os.path.join(output_path, "inventory-vpc-peerings.csv"), "VPC Peerings")
+        export_csv(store.vgws, os.path.join(output_path, "inventory-vgws.csv"), "VGWs")
+        export_csv(store.cgws, os.path.join(output_path, "inventory-cgws.csv"), "Customer GWs")
+        export_csv(store.vpn_connections, os.path.join(output_path, "inventory-vpn-connections.csv"), "VPN Connections")
+        export_csv(store.dx_connections, os.path.join(output_path, "inventory-dx-connections.csv"), "Direct Connect")
+        export_csv(store.network_firewalls, os.path.join(output_path, "inventory-network-firewalls.csv"), "Network Firewalls")
+        export_csv(store.r53_resolver_endpoints, os.path.join(output_path, "inventory-r53-resolver.csv"), "R53 Resolver")
+        export_csv(store.nat_gateways, os.path.join(output_path, "inventory-nat-gateways.csv"), "NAT Gateways")
+        bp_path = os.path.join(output_path, "best-practices-report.csv")
+        export_csv(store.best_practices, bp_path, "Best Practices")
+        files["best_practices_csv"] = bp_path
+
+    # ── Mermaid .mmd (siempre) ──
     mermaid_path = os.path.join(output_path, "hub-spoke-topology.mmd")
     with open(mermaid_path, "w", encoding="utf-8") as f:
         f.write(mermaid_content)
-    write_status(f"  Diagrama Mermaid: {mermaid_path}", "OK")
+    write_status(f"  🗺️  Diagrama Mermaid: {mermaid_path}", "OK")
     files["mermaid"] = mermaid_path
 
-    # ── Markdown Summary ──
+    # ── Markdown Summary (siempre) ──
     md_path = os.path.join(output_path, "architecture-summary.md")
     md = _generate_markdown_summary(store, mermaid_content)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md)
-    write_status(f"  Resumen Markdown: {md_path}", "OK")
+    write_status(f"  📝 Resumen Markdown: {md_path}", "OK")
     files["summary_md"] = md_path
 
     return files
@@ -1897,13 +2246,15 @@ def main():
     write_status("                   EJECUCIÓN COMPLETA                      ")
     write_status("═══════════════════════════════════════════════════════════")
     write_status("Archivos generados:", "OK")
-    write_status(f"  📊 {files.get('best_practices_csv', '')}")
+    if "xlsx" in files:
+        write_status(f"  📊 {files['xlsx']}")
+    else:
+        write_status(f"  📊 {args.output}/inventory-*.csv + best-practices-report.csv")
     write_status(f"  🗺️  {files.get('mermaid', '')}")
     write_status(f"  📝 {files.get('summary_md', '')}")
-    write_status(f"  📋 {args.output}/inventory-*.csv")
     write_status("")
     write_status("Próximos pasos:")
-    write_status("  1. Revisar el CSV de best practices y remediar los FAIL")
+    write_status("  1. Abrir el libro Excel y revisar la hoja 'Best Practices'")
     write_status("  2. Pegar el contenido .mmd en https://mermaid.live para visualizar")
     write_status("  3. Integrar en pipeline de gobernanza (AWS Config / CodePipeline)")
     write_status("═══════════════════════════════════════════════════════════")
