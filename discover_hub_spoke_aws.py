@@ -63,7 +63,7 @@ except ImportError:
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 DEFAULT_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "eu-central-1", "sa-east-1",
@@ -486,7 +486,7 @@ def collect_resources(
         # ── 1.7 Virtual Private Gateways ─────────────────────────────────
         write_status(f"    Descubriendo VPN / VGWs...")
         vgws_raw = safe_api_call(
-            lambda: paginate(ec2, "describe_vpn_gateways", "VpnGateways"), default=[]
+            lambda: ec2.describe_vpn_gateways().get("VpnGateways", []), default=[]
         )
         for vgw in vgws_raw:
             name_tag = _get_name_tag(vgw.get("Tags", []))
@@ -508,7 +508,7 @@ def collect_resources(
 
         # ── 1.8 Customer Gateways ────────────────────────────────────────
         cgws_raw = safe_api_call(
-            lambda: paginate(ec2, "describe_customer_gateways", "CustomerGateways"),
+            lambda: ec2.describe_customer_gateways().get("CustomerGateways", []),
             default=[],
         )
         for cgw in cgws_raw:
@@ -526,7 +526,7 @@ def collect_resources(
 
         # ── 1.9 VPN Connections ──────────────────────────────────────────
         vpns_raw = safe_api_call(
-            lambda: paginate(ec2, "describe_vpn_connections", "VpnConnections"),
+            lambda: ec2.describe_vpn_connections().get("VpnConnections", []),
             default=[],
         )
         for vpn in vpns_raw:
